@@ -1,108 +1,86 @@
 from dotenv import load_dotenv
 import os
-import semantic_kernel as sk
+import asyncio
+from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
-from semantic_kernel.skill_definition import sk_function, sk_function_context_parameter
-from semantic_kernel.orchestration.sk_context import SKContext
-from semantic_kernel.planning.basic_planner import BasicPlanner
-import math
+from semantic_kernel.contents import ChatHistory
+from semantic_kernel.functions import kernel_function
 
 
 class TravelWeather:
-    @sk_function(
+    @kernel_function(
         description="Takes a city and a month and returns the average temperature for that month.",
         name="travel_weather",
     )
-    @sk_function_context_parameter(
-        name="city", description="The city for which to get the average temperature."
-    )
-    @sk_function_context_parameter(
-        name="month", description="The month for which to get the average temperature."
-    )
-    def weather(self, context: SKContext) -> str:
-        return f"The average temperature in city in month is 75 degrees. {str(context.variables)}"
-
-        city = context["city"]
-        month = context["month"]
+    def weather(self, city: str, month: str) -> str:
         return f"The average temperature in {city} in {month} is 75 degrees."
-    
 
 
 async def main():
-    # Load the .env file. Replace the path with the path to your .env file.
-    load_dotenv('/Users/alfredo/.secrets/azure-open-ai.sh')
-    AZURE_OPEN_AI__CHAT_COMPLETION_DEPLOYMENT_NAME = os.environ["AZURE_OPEN_AI__CHAT_COMPLETION_DEPLOYMENT_NAME"]
-    AZURE_OPEN_AI__ENDPOINT = os.environ["AZURE_OPEN_AI__ENDPOINT"]
-    AZURE_OPEN_AI__API_KEY = os.environ["AZURE_OPEN_AI__API_KEY"]
-
-    kernel = sk.Kernel(log=sk.NullLogger())
-    kernel.add_chat_service(
-        "chat-gpt",
-        AzureChatCompletion(
-            AZURE_OPEN_AI__CHAT_COMPLETION_DEPLOYMENT_NAME,
-            AZURE_OPEN_AI__ENDPOINT,
-            AZURE_OPEN_AI__API_KEY,
-            api_version = "2023-07-01-preview"
-        ),
-    )
-
-
-    #planner = BasicPlanner()
-    weather_plugin = kernel.import_skill(TravelWeather(), skill_name="Travel")
-    prompt_config = sk.PromptTemplateConfig.from_completion_parameters(
-        max_tokens=2000,
-        temperature=0.7,
-        top_p=0.8,
-        function_call="auto",
-        chat_system_prompt="You are a travel weather chat bot. Your name is Frederick. You are trying to help people find the average temperature in a city in a month.",
-    )
-    prompt_template = sk.ChatPromptTemplate(
-        "{{$user_input}}", kernel.prompt_template_engine, prompt_config
-    )
-    prompt_template.add_user_message("Hi there, who are you?")
-    prompt_template.add_assistant_message(
-        "I am Frederic, a chat bot. I'm trying to figure out what people need."
-    )
-
-    function_config = sk.SemanticFunctionConfig(prompt_config, prompt_template)
-    chat_function = kernel.register_semantic_function("ChatBot", "Chat", function_config)
-    functions = [
-        {
-            "name": "travel_weather",
-            "description": "Finds the average temperature for a city in a month.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "The city for example Madrid",
-                    },
-                    "month": {
-                        "type": "string",
-                        "description": "The month of the year, for example June",
-                    },
-                },
-                "required": ["city", "month"],
-            },
-        }
+    # Load the .env file from the examples directory or current directory
+    env_paths = [
+        #'./examples/1-simple/.env',
+        './.env'
     ]
-    context = kernel.create_new_context()
-
-    context.variables["user_input"] = "What is the average temperature in Seattle in June?"
-    context = await chat_function.invoke_async(context=context, functions=functions)
     
-    if context.error_occurred:
-        print(f"Error occurred: {context.last_error_description}")
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+    
+    # Try both old and new environment variable names
+    deployment_name = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not all([deployment_name, endpoint, api_key]):
+        print("Error: Missing required environment variables. Please check your .env file.")
+        print("Expected variables: AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY")
         return
 
-    chat_function._chat_prompt_template.messages.append({"role": "assistant", "content": "It is 85 degrees in Seattle in June"})
-    context = await chat_function.invoke_async(context=context, functions=functions)
-    print("No function was called")
-    print(f"Output was: {str(context)}")
+    # Initialize the kernel
+    kernel = Kernel()
+    
+    # Add the chat service
+    chat_service = AzureChatCompletion(
+        deployment_name=deployment_name,
+        endpoint=endpoint,
+        api_key=api_key,
+        api_version="2024-12-01-preview"
+    )
+    kernel.add_service(chat_service)
+
+    # Add the weather plugin
+    weather_plugin = TravelWeather()
+    kernel.add_plugin(weather_plugin, plugin_name="Travel")
+
+    # Create chat history
+    chat_history = ChatHistory()
+    chat_history.add_system_message("You are a boisterous travel weather chat bot. Your name is Frederick. You are trying to help people find the average temperature in a city in a month.")
+    chat_history.add_user_message("What is the average temperature in San Francisco in June?")
+
+    # Get the chat completion service
+    chat_completion = kernel.get_service(type=AzureChatCompletion)
+    
+    # Enable function calling
+    execution_settings = chat_completion.get_prompt_execution_settings_class()(
+        function_call_behavior="auto", temperature=1.0, max_completion_tokens=5000, prompt_template="You are a travel weather chat bot. Your name is Frederick. You are trying to help people find the average temperature in a city in a month."
+    )
+
+    # Get a response from the chat completion service
+    response = await chat_completion.get_chat_message_contents(
+        chat_history=chat_history,
+        settings=execution_settings,
+        kernel=kernel
+    )
+
+    if response:
+        print(f"Assistant: {response[0].content}")
+        chat_history.add_assistant_message(str(response[0].content))
+    else:
+        print("No response received")
 
 
 # Run the main function
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
